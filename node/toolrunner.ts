@@ -370,5 +370,133 @@ export class ToolRunner extends events.EventEmitter {
         res.stdout = (r.stdout) ? r.stdout.toString() : null;
         res.stderr = (r.stderr) ? r.stderr.toString() : null;
         return res;
-    }   
+    }
+
+    public pipe(tool: ToolRunner, options?: IExecOptions) : Q.Promise<number> {
+        var defer = Q.defer<number>();
+
+        var success = true;
+        options = options || <IExecOptions>{};
+
+        var ops: IExecOptions = <IExecOptions>{
+            cwd: options.cwd || process.cwd(),
+            env: options.env || process.env,
+            silent: options.silent || false,
+            failOnStdErr: options.failOnStdErr || false,
+            ignoreReturnCode: options.ignoreReturnCode || false
+        };
+
+        ops.outStream = options.outStream || <stream.Writable>process.stdout;
+        ops.errStream = options.errStream || <stream.Writable>process.stderr;
+
+        var argString1 = this.args.join(' ') || '';
+        var cmdString1 = this.toolPath;
+        if (argString1) {
+            cmdString1 += (' ' + argString1);
+        }
+
+        var argString2 = tool.args.join(' ') || '';
+        var cmdString2 = tool.toolPath;
+        if (argString2) {
+            cmdString2 += (' ' + argString2);
+        }
+
+        if (!ops.silent) {
+            ops.outStream.write('[command]' + cmdString1 + ' | ' + cmdString2  + os.EOL);
+        }
+
+        var cpFirst = child.spawn(this.toolPath, this.args, { cwd: ops.cwd, env: ops.env });
+        var cpSecond = child.spawn(tool.toolPath, tool.args, { cwd: ops.cwd, env: ops.env });
+
+        cpFirst.stdout.on('data', (data: Buffer) => {
+            cpSecond.stdin.write(data);
+        });
+        cpFirst.stderr.on('data', (data: Buffer) => {
+            cpSecond.stdin.write(data);
+        });
+        cpFirst.on('close', (code, signal) => {
+            cpSecond.stdin.end();
+        });
+
+        var processLineBuffer = (data: Buffer, strBuffer: string, onLine:(line: string) => void): void => {
+            try {
+                var s = strBuffer + data.toString();
+                var n = s.indexOf(os.EOL);
+
+                while(n > -1) {
+                    var line = s.substring(0, n);
+                    onLine(line);
+
+                    // the rest of the string ...
+                    s = s.substring(n + os.EOL.length);
+                    n = s.indexOf(os.EOL);
+                }
+
+                strBuffer = s;
+            }
+            catch (err) {
+                // streaming lines to console is best effort.  Don't fail a build.
+                this._debug('error processing line');
+            }
+
+        }
+
+        var stdbuffer: string = '';
+        cpSecond.stdout.on('data', (data: Buffer) => {
+            this.emit('stdout', data);
+
+            if (!ops.silent) {
+                ops.outStream.write(data);
+            }
+
+            processLineBuffer(data, stdbuffer, (line: string) => {
+                this.emit('stdline', line);
+            });
+        });
+
+        var errbuffer: string = '';
+        cpSecond.stderr.on('data', (data: Buffer) => {
+            this.emit('stderr', data);
+
+            success = !ops.failOnStdErr;
+            if (!ops.silent) {
+                var s = ops.failOnStdErr ? ops.errStream : ops.outStream;
+                s.write(data);
+            }
+
+            processLineBuffer(data, errbuffer, (line: string) => {
+                this.emit('errline', line);
+            });
+        });
+
+        cpSecond.on('error', (err) => {
+            defer.reject(new Error(this.toolPath + ' failed. ' + err.message));
+        });
+
+        cpSecond.on('close', (code, signal) => {
+            this._debug('rc:' + code);
+
+            if (stdbuffer.length > 0) {
+                this.emit('stdline', stdbuffer);
+            }
+
+            if (errbuffer.length > 0) {
+                this.emit('errline', errbuffer);
+            }
+
+            if (code != 0 && !ops.ignoreReturnCode) {
+                success = false;
+            }
+
+            this._debug('success:' + success);
+            if (success) {
+                defer.resolve(code);
+            }
+            else {
+                defer.reject(new Error(this.toolPath + ' failed with return code: ' + code));
+            }
+        });
+
+        return <Q.Promise<number>>defer.promise;
+    }
 }
